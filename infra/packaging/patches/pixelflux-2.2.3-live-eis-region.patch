@@ -1,0 +1,157 @@
+diff --git a/pixelflux/src/wayland/eiclient.rs b/pixelflux/src/wayland/eiclient.rs
+index 4474afa..3e34c13 100644
+--- a/pixelflux/src/wayland/eiclient.rs
++++ b/pixelflux/src/wayland/eiclient.rs
+@@ -52,6 +52,7 @@ enum Cmd {
+     MotionAbsolute {
+         x: f32,
+         y: f32,
++        output_fraction: Option<(f64, f64)>,
+     },
+     MotionRelative {
+         dx: f32,
+@@ -132,10 +133,16 @@ impl EiInjector {
+         let _ = nix_write(self.wake.as_raw_fd());
+     }
+
+-    pub(crate) fn pointer_motion_abs(&self, x: f64, y: f64) {
++    pub(crate) fn pointer_motion_abs(
++        &self,
++        x: f64,
++        y: f64,
++        output_fraction: Option<(f64, f64)>,
++    ) {
+         self.push(Cmd::MotionAbsolute {
+             x: x as f32,
+             y: y as f32,
++            output_fraction,
+         });
+     }
+
+@@ -190,6 +197,13 @@ fn nix_write(fd: i32) -> std::io::Result<()> {
+     Ok(())
+ }
+
++struct PointerRegion {
++    x: u32,
++    y: u32,
++    width: u32,
++    height: u32,
++}
++
+ /// One device the server created: its proto object and the emulation state we keep for it.
+ struct Device {
+     device: ei::Device,
+@@ -198,6 +212,7 @@ struct Device {
+     sequence: u32,
+     pointer: Option<ei::Pointer>,
+     pointer_abs: Option<ei::PointerAbsolute>,
++    single_region: Option<PointerRegion>,
+     button: Option<ei::Button>,
+     scroll: Option<ei::Scroll>,
+     keyboard: Option<ei::Keyboard>,
+@@ -374,6 +389,15 @@ impl Worker {
+                 self.devices.push(Device {
+                     pointer: device.interface(),
+                     pointer_abs: device.interface(),
++                    single_region: match device.regions() {
++                        [region] if region.width > 0 && region.height > 0 => Some(PointerRegion {
++                            x: region.x,
++                            y: region.y,
++                            width: region.width,
++                            height: region.height,
++                        }),
++                        _ => None,
++                    },
+                     button: device.interface(),
+                     scroll: device.interface(),
+                     keyboard: device.interface(),
+@@ -426,8 +450,26 @@ impl Worker {
+
+     fn emit(&mut self, cmd: Cmd) {
+         match cmd {
+-            Cmd::MotionAbsolute { x, y } => {
++            Cmd::MotionAbsolute {
++                x,
++                y,
++                output_fraction,
++            } => {
+                 if let Some(i) = self.ready_index(|d| d.pointer_abs.is_some()) {
++                    let (x, y) = match (output_fraction, &self.devices[i].single_region) {
++                        (Some((fx, fy)), Some(region)) => {
++                            let project = |fraction: f64, offset: u32, length: u32| {
++                                let size = f64::from(length);
++                                (f64::from(offset) + (fraction * size).clamp(0.0, size - 1.0))
++                                    as f32
++                            };
++                            (
++                                project(fx, region.x, region.width),
++                                project(fy, region.y, region.height),
++                            )
++                        }
++                        _ => (x, y),
++                    };
+                     self.start(i);
+                     self.devices[i]
+                         .pointer_abs
+diff --git a/pixelflux/src/wayland/host.rs b/pixelflux/src/wayland/host.rs
+index f8e9cd4..732bfe0 100644
+--- a/pixelflux/src/wayland/host.rs
++++ b/pixelflux/src/wayland/host.rs
+@@ -1778,6 +1778,16 @@ impl HostSession {
+             node: stream.node_id,
+             logical: stream_point(slot, stream.size.unwrap_or(slot.want), x, y),
+             position: stream.position,
++            // A desktop with one output maps unambiguously to a single EIS
++            // region. Send the fraction so EIS can use the region of its
++            // current device, not the portal's session-start dimensions.
++            output_fraction: (self.outputs.len() == 1 && slot.want.0 > 0 && slot.want.1 > 0)
++                .then(|| {
++                    (
++                        (x - f64::from(slot.pos.0)) / f64::from(slot.want.0),
++                        (y - f64::from(slot.pos.1)) / f64::from(slot.want.1),
++                    )
++                }),
+         })
+     }
+
+@@ -1823,18 +1833,28 @@ impl HostSession {
+         *self.pointer_at.lock().unwrap() = (x, y);
+         if let Some(live) = self.portal_ei() {
+             let ei = live.ei.as_ref().unwrap();
++            let target = self.portal_target(x, y);
++            let output_fraction = target.as_ref().and_then(|point| point.output_fraction);
+             if let Some(PortalPoint {
+                 logical,
+                 position: Some(pos),
+                 ..
+-            }) = self.portal_target(x, y)
++            }) = target
+             {
+-                ei.pointer_motion_abs(pos.0 as f64 + logical.0, pos.1 as f64 + logical.1);
++                ei.pointer_motion_abs(
++                    f64::from(pos.0) + logical.0,
++                    f64::from(pos.1) + logical.1,
++                    output_fraction,
++                );
+                 return;
+             }
+             let (w, h) = self.extent();
+             if w > 0 && h > 0 {
+-                ei.pointer_motion_abs(x.clamp(0.0, (w - 1) as f64), y.clamp(0.0, (h - 1) as f64));
++                ei.pointer_motion_abs(
++                    x.clamp(0.0, f64::from(w - 1)),
++                    y.clamp(0.0, f64::from(h - 1)),
++                    output_fraction,
++                );
+             }
+             return;
+         }
+@@ -2151,6 +2171,7 @@ struct PortalPoint {
+     logical: (f64, f64),
+     /// The stream's position in the compositor's logical space, where the portal gave one.
+     position: Option<(i32, i32)>,
++    output_fraction: Option<(f64, f64)>,
+ }
+
+ /// A union-layout point in the logical space of the stream behind `slot`: the slot captures

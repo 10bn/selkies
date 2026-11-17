@@ -47,7 +47,7 @@ cd /out
 fpm -s dir -t rpm \
     --name selkies \
     --version "$(tilde_version "${SELKIES_VERSION:-0.0.0}")" \
-    --iteration "1.${DISTRO_TAG:-linux}" \
+    --iteration "${SELKIES_RPM_ITERATION:-1.${DISTRO_TAG:-linux}}" \
     --architecture "${RPM_ARCH}" \
     --description "Low-latency HTML5 remote desktop streaming (WebSocket and WebRTC)" \
     --url "https://github.com/selkies-project/selkies" \
