@@ -38,21 +38,23 @@
 //! matching `outclient`. Blocking, off the compositor thread, with every
 //! round-trip deadline-bounded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::wayland::kdeproto::output_device::{
     kde_output_device_mode_v2::{self, KdeOutputDeviceModeV2},
+    kde_output_device_registry_v2::{self, KdeOutputDeviceRegistryV2},
     kde_output_device_v2::{self, KdeOutputDeviceV2},
 };
 use crate::wayland::kdeproto::output_management::{
+    kde_mode_list_v2::KdeModeListV2,
     kde_output_configuration_v2::{self, KdeOutputConfigurationV2},
     kde_output_management_v2::KdeOutputManagementV2,
 };
 use wayland_client::protocol::wl_registry;
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop};
 use wayland_protocols_plasma::screencast::v1::client::{
     zkde_screencast_stream_unstable_v1::{self, ZkdeScreencastStreamUnstableV1},
     zkde_screencast_unstable_v1::ZkdeScreencastUnstableV1,
@@ -282,6 +284,29 @@ struct Device {
     pos: (i32, i32),
     scale: f64,
     current: Option<KdeOutputDeviceModeV2>,
+    modes: Vec<KdeOutputDeviceModeV2>,
+}
+
+impl Device {
+    fn new(dev: KdeOutputDeviceV2) -> Self {
+        Self {
+            dev,
+            name: None,
+            enabled: false,
+            pos: (0, 0),
+            scale: 1.0,
+            current: None,
+            modes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Mode {
+    size: (i32, i32),
+    refresh: i32,
+    flags: u32,
+    cvt: Option<[u32; 12]>,
 }
 
 #[derive(Default)]
@@ -290,7 +315,9 @@ struct KdeOutState {
     devices: Vec<Device>,
     /// Size per announced mode object; a device carries no size of its own,
     /// so its current mode's is reported.
-    modes: Vec<(KdeOutputDeviceModeV2, (i32, i32))>,
+    modes: HashMap<KdeOutputDeviceModeV2, Mode>,
+    host_control: bool,
+    device_registry: Option<(u32, u32)>,
     applied: Option<bool>,
     sync_done: bool,
 }
@@ -318,23 +345,43 @@ impl Dispatch<wl_registry::WlRegistry, ()> for KdeOutState {
         } = event
         {
             if interface == "kde_output_management_v2" && state.manager.is_none() {
-                state.manager = Some(registry.bind(name, version.min(1), qh, ()));
+                let max_version = if state.host_control { 22 } else { 1 };
+                state.manager = Some(registry.bind(name, version.min(max_version), qh, ()));
+            } else if interface == "kde_output_device_registry_v2"
+                && state.host_control
+                && version >= 21
+            {
+                state.device_registry = Some((name, version));
             } else if interface == "kde_output_device_v2" {
-                // Version 2 carries the name event screens are addressed by.
-                let dev: KdeOutputDeviceV2 = registry.bind(name, version.min(2), qh, ());
-                state.devices.push(Device {
-                    dev,
-                    name: None,
-                    enabled: false,
-                    pos: (0, 0),
-                    scale: 1.0,
-                    current: None,
-                });
+                // Version 2 carries the name; version 24 can describe existing custom timings.
+                let max_version = if state.host_control { 24 } else { 2 };
+                let dev: KdeOutputDeviceV2 = registry.bind(name, version.min(max_version), qh, ());
+                state.devices.push(Device::new(dev));
             }
         }
     }
 }
 delegate_noop!(KdeOutState: KdeOutputManagementV2);
+delegate_noop!(KdeOutState: KdeModeListV2);
+
+impl Dispatch<KdeOutputDeviceRegistryV2, ()> for KdeOutState {
+    fn event(
+        state: &mut Self,
+        _: &KdeOutputDeviceRegistryV2,
+        event: kde_output_device_registry_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let kde_output_device_registry_v2::Event::Output { output } = event {
+            state.devices.push(Device::new(output));
+        }
+    }
+
+    wayland_client::event_created_child!(KdeOutState, KdeOutputDeviceRegistryV2, [
+        kde_output_device_registry_v2::EVT_OUTPUT_OPCODE => (KdeOutputDeviceV2, ()),
+    ]);
+}
 
 impl Dispatch<KdeOutputDeviceV2, ()> for KdeOutState {
     fn event(
@@ -345,6 +392,11 @@ impl Dispatch<KdeOutputDeviceV2, ()> for KdeOutState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if matches!(event, kde_output_device_v2::Event::Removed) {
+            state.devices.retain(|d| &d.dev != dev);
+            dev.release();
+            return;
+        }
         let Some(entry) = state.devices.iter_mut().find(|d| &d.dev == dev) else {
             return;
         };
@@ -354,6 +406,7 @@ impl Dispatch<KdeOutputDeviceV2, ()> for KdeOutState {
             kde_output_device_v2::Event::Geometry { x, y, .. } => entry.pos = (x, y),
             kde_output_device_v2::Event::Scale { factor } => entry.scale = factor,
             kde_output_device_v2::Event::CurrentMode { mode } => entry.current = Some(mode),
+            kde_output_device_v2::Event::Mode { mode } => entry.modes.push(mode),
             _ => {}
         }
     }
@@ -372,10 +425,49 @@ impl Dispatch<KdeOutputDeviceModeV2, ()> for KdeOutState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let kde_output_device_mode_v2::Event::Size { width, height } = event {
-            let mode = mode.clone();
-            state.modes.retain(|(m, _)| *m != mode);
-            state.modes.push((mode, (width, height)));
+        use kde_output_device_mode_v2::Event;
+        if matches!(event, Event::Removed) {
+            state.modes.remove(mode);
+            for device in &mut state.devices {
+                device.modes.retain(|id| id != mode);
+            }
+            return;
+        }
+        let entry = state.modes.entry(mode.clone()).or_default();
+        match event {
+            Event::Size { width, height } => entry.size = (width, height),
+            Event::Refresh { refresh } => entry.refresh = refresh,
+            Event::Flags { flags } => entry.flags = flags.into(),
+            Event::Cvt {
+                dot_clock,
+                hdisplay,
+                hsync_start,
+                hsync_end,
+                htotal,
+                hskew,
+                vdisplay,
+                vsync_start,
+                vsync_end,
+                vtotal,
+                vscan,
+                flags,
+            } => {
+                entry.cvt = Some([
+                    dot_clock,
+                    hdisplay,
+                    hsync_start,
+                    hsync_end,
+                    htotal,
+                    hskew,
+                    vdisplay,
+                    vsync_start,
+                    vsync_end,
+                    vtotal,
+                    vscan,
+                    flags,
+                ]);
+            }
+            _ => {}
         }
     }
 }
@@ -401,15 +493,24 @@ impl Dispatch<KdeOutputConfigurationV2, ()> for KdeOutState {
 /// state: one round-trip announces them, a second delivers their events.
 fn read_devices(
     socket_path: &str,
+    host_control: bool,
 ) -> Result<(Connection, EventQueue<KdeOutState>, KdeOutState), String> {
     let stream =
         UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
     let conn = Connection::from_socket(stream).map_err(|e| format!("wayland setup: {e}"))?;
     let mut queue: EventQueue<KdeOutState> = conn.new_event_queue();
     let qh = queue.handle();
-    let _registry = conn.display().get_registry(&qh, ());
-    let mut state = KdeOutState::default();
+    let registry = conn.display().get_registry(&qh, ());
+    let mut state = KdeOutState {
+        host_control,
+        ..Default::default()
+    };
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
+    if let Some((name, version)) = state.device_registry {
+        // Prefer the new registry when both it and legacy per-device globals are offered.
+        state.devices.clear();
+        let _: KdeOutputDeviceRegistryV2 = registry.bind(name, version.min(24), &qh, ());
+    }
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
     Ok((conn, queue, state))
 }
@@ -432,7 +533,7 @@ fn enabled_sorted(state: &KdeOutState) -> Vec<usize> {
 /// order; the size is the current mode's, `(0, 0)` where none was announced.
 /// Empty when the compositor serves no `kde_output_device_v2` globals.
 pub fn list_screens(socket_path: &str) -> Result<Vec<super::AppScreen>, String> {
-    let (_conn, _queue, state) = read_devices(socket_path)?;
+    let (_conn, _queue, state) = read_devices(socket_path, false)?;
     let screens = enabled_sorted(&state)
         .into_iter()
         .map(|i| {
@@ -440,8 +541,8 @@ pub fn list_screens(socket_path: &str) -> Result<Vec<super::AppScreen>, String> 
             let (w, h) = d
                 .current
                 .as_ref()
-                .and_then(|mode| state.modes.iter().find(|(m, _)| m == mode))
-                .map(|(_, size)| *size)
+                .and_then(|mode| state.modes.get(mode))
+                .map(|mode| mode.size)
                 .unwrap_or((0, 0));
             (d.name.clone().unwrap_or_default(), d.pos.0, d.pos.1, w, h)
         })
@@ -462,7 +563,7 @@ pub fn set_screen_layout(
     if rects.iter().any(|(_, _, w, h)| *w <= 0 || *h <= 0) {
         return Err("a screen rectangle has a non-positive size".to_string());
     }
-    let (conn, mut queue, mut state) = read_devices(socket_path)?;
+    let (conn, mut queue, mut state) = read_devices(socket_path, false)?;
     let Some(manager) = state.manager.clone() else {
         return Ok(0);
     };
@@ -520,4 +621,154 @@ fn apply_configuration(
         Some(false) => Err("the compositor refused the configuration".to_string()),
         None => Err("timed out waiting for the configuration".to_string()),
     }
+}
+
+/// Controller for the single virtual screen of an explicitly opted-in KWin host.
+pub struct VirtualOutputControl {
+    socket: String,
+    /// Identity by pixel size is sufficient: only newly added sizes are marked as ours.
+    added_modes: Mutex<HashSet<(i32, i32)>>,
+}
+
+impl VirtualOutputControl {
+    pub fn new(socket: String) -> Self {
+        Self {
+            socket,
+            added_modes: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Set the physical mode or native desktop scale; return false on other outputs or
+    /// servers. Neither operation changes the other property.
+    pub fn configure(&self, size: Option<(i32, i32)>, scale: Option<f64>) -> Result<bool, String> {
+        let mut added_modes = self.added_modes.lock().map_err(|e| e.to_string())?;
+        let (conn, mut queue, mut state) = read_devices(&self.socket, true)?;
+        let Some(manager) = state.manager.clone() else {
+            return Ok(false);
+        };
+        let Some(mut index) = virtual_output(&state) else {
+            return Ok(false);
+        };
+        if let Some(size) = size
+            && mode_for(&state, index, size).is_none()
+        {
+            let output = &state.devices[index];
+            // Version 19 identifies existing custom modes so they can be preserved.
+            if manager.version() < 18 || output.dev.version() < 19 {
+                return Ok(false);
+            }
+            let qh = queue.handle();
+            let list = manager.create_mode_list(&qh, ());
+            let mut removed_sizes = Vec::new();
+            for id in &output.modes {
+                let Some(mode) = state.modes.get(id).filter(|m| m.flags & 1 != 0) else {
+                    continue;
+                };
+                if added_modes.contains(&mode.size) && output.current.as_ref() != Some(id) {
+                    removed_sizes.push(mode.size);
+                    continue;
+                }
+                if let Some([clock, hd, hss, hse, ht, hs, vd, vss, vse, vt, vs, flags]) = mode.cvt {
+                    if list.version() < 22 {
+                        return Ok(false);
+                    }
+                    list.add_cvt(clock, hd, hss, hse, ht, hs, vd, vss, vse, vt, vs, flags);
+                } else {
+                    if mode.refresh <= 0 || mode.size.0 <= 0 || mode.size.1 <= 0 {
+                        return Ok(false);
+                    }
+                    add_mode(&list, mode.size, mode.refresh as u32, (mode.flags >> 1) & 1);
+                }
+            }
+            add_mode(&list, size, 60_000, 1);
+            let config = manager.create_configuration(&qh, ());
+            config.set_custom_modes(&output.dev, &list);
+            list.destroy();
+            apply_configuration(&conn, &mut queue, &mut state, config)?;
+            let Some(updated_index) = virtual_output(&state) else {
+                return Ok(false);
+            };
+            index = updated_index;
+            for removed in removed_sizes {
+                added_modes.remove(&removed);
+            }
+            if mode_for(&state, index, size).is_some() {
+                added_modes.insert(size);
+            }
+        }
+
+        let output = &state.devices[index];
+        let mode = match size {
+            Some(size) => {
+                let Some(mode) = mode_for(&state, index, size) else {
+                    return Err(format!(
+                        "KWin did not advertise the requested {}x{} mode",
+                        size.0, size.1
+                    ));
+                };
+                Some(mode).filter(|mode| Some(*mode) != output.current.as_ref())
+            }
+            None => None,
+        };
+        // Wayland fixed-point values have 1/256 precision.
+        let scale = scale.filter(|s| (output.scale - s).abs() >= 1.0 / 256.0);
+        if mode.is_some() || scale.is_some() {
+            let config = manager.create_configuration(&queue.handle(), ());
+            if let Some(mode) = mode {
+                config.mode(&output.dev, mode);
+            }
+            if let Some(scale) = scale {
+                config.scale(&output.dev, scale);
+            }
+            apply_configuration(&conn, &mut queue, &mut state, config)?;
+            let output = virtual_output(&state)
+                .and_then(|i| state.devices.get(i))
+                .ok_or("the virtual output was removed")?;
+            if size.is_some_and(|requested| {
+                output
+                    .current
+                    .as_ref()
+                    .and_then(|id| state.modes.get(id))
+                    .map(|m| m.size)
+                    != Some(requested)
+            }) || scale.is_some_and(|requested| (output.scale - requested).abs() >= 1.0 / 120.0)
+            {
+                return Err(
+                    "KWin did not realize the requested virtual output configuration".to_string(),
+                );
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn virtual_output(state: &KdeOutState) -> Option<usize> {
+    let mut enabled = state.devices.iter().enumerate().filter(|(_, d)| d.enabled);
+    let (index, output) = enabled.next()?;
+    (enabled.next().is_none() && matches!(output.name.as_deref(), Some("Virtual-0" | "Virtual-1")))
+        .then_some(index)
+}
+
+fn mode_for(state: &KdeOutState, index: usize, size: (i32, i32)) -> Option<&KdeOutputDeviceModeV2> {
+    let output = &state.devices[index];
+    let matches_size =
+        |id: &&KdeOutputDeviceModeV2| state.modes.get(*id).is_some_and(|mode| mode.size == size);
+    output
+        .current
+        .iter()
+        .chain(&output.modes)
+        .filter(matches_size)
+        .max_by_key(|id| {
+            (
+                Some(*id) == output.current.as_ref(),
+                state.modes[*id].refresh,
+            )
+        })
+}
+
+fn add_mode(list: &KdeModeListV2, size: (i32, i32), refresh: u32, reduced_blanking: u32) {
+    list.set_resolution(size.0 as u32, size.1 as u32);
+    list.set_refresh_rate(refresh);
+    list.set_reduced_blanking(reduced_blanking);
+    list.add_mode();
 }

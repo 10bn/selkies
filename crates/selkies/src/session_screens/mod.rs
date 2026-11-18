@@ -357,6 +357,67 @@ impl SessionScreens {
         !settings().wayland_host_display().trim().is_empty()
     }
 
+    /// A deliberately opted-in external KWin session owns its physical mode and UI scale.
+    fn kwin_host(&self) -> Option<Arc<pixelflux::wayland::kdeclient::VirtualOutputControl>> {
+        use pixelflux::wayland::kdeclient::VirtualOutputControl;
+        use std::sync::OnceLock;
+
+        if !self.is_wayland
+            || !Self::host_capture()
+            || !settings().enable_resize().on
+            || !std::env::var("SELKIES_KWIN_HOST_CONTROL").is_ok_and(|value| value == "true")
+            || !std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|value| {
+                value
+                    .split(':')
+                    .any(|desktop| desktop.eq_ignore_ascii_case("KDE"))
+            })
+        {
+            return None;
+        }
+        let display = PathBuf::from(settings().wayland_host_display().trim());
+        let socket = if display.is_absolute() {
+            display
+        } else {
+            self.runtime_dir()?.join(display)
+        };
+        let socket = socket.to_str()?.to_owned();
+        // There is one host for both transports. The controller serializes its transactions.
+        static HOST: OnceLock<Arc<VirtualOutputControl>> = OnceLock::new();
+        Some(
+            HOST.get_or_init(|| Arc::new(VirtualOutputControl::new(socket)))
+                .clone(),
+        )
+    }
+
+    async fn configure_kwin_host(&self, size: Option<(i32, i32)>, scale: Option<f64>) -> bool {
+        let Some(host) = self.kwin_host() else {
+            return false;
+        };
+        match tokio::task::spawn_blocking(move || host.configure(size, scale)).await {
+            Ok(Ok(applied)) => applied,
+            Ok(Err(error)) => {
+                warn!(target: "display", "KWin virtual output configuration failed: {error}");
+                false
+            }
+            Err(error) => {
+                warn!(target: "display", "KWin virtual output worker failed: {error}");
+                false
+            }
+        }
+    }
+
+    /// Apply the requested browser dimensions to the physical host mode, independently of the
+    /// desktop scale. The width aligns with the KWin mode and the H.264 encoder, and the
+    /// target stays below the H.264 4096-pixel limit.
+    pub(crate) async fn resize_kwin_host(&self, width: i32, height: i32) -> bool {
+        if width <= 0 || height <= 0 {
+            return false;
+        }
+        let (width, height) = crate::display::fit_res(width, height, 4080, 4080);
+        let size = ((width & !15).max(640), (height & !1).max(480));
+        self.configure_kwin_host(Some(size), None).await
+    }
+
     /// `f` over the backend on a blocking thread; `None` without a backend or when the thread
     /// panicked.
     async fn blocking<T: Send + 'static>(
@@ -806,6 +867,12 @@ impl SessionScreens {
             return 1.0;
         };
         let scale = (value / 96.0).max(0.1);
+        if display_id == PRIMARY_DISPLAY || display_id.is_empty() {
+            let host_scale = ((scale.clamp(1.0, 3.0) * 120.0).round()) / 120.0;
+            if self.configure_kwin_host(None, Some(host_scale)).await {
+                return 1.0;
+            }
+        }
         let Some((display, true)) = self.resolve().await else {
             return scale;
         };

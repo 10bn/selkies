@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 
 use crate::audio::{AudioEngine, AudioPacket, MicWrite, MicrophoneUplink};
 use crate::capture::{DisplayCapture, FrameBatch};
-use crate::core::{DisplayId, Role};
+use crate::core::{DisplayId, PRIMARY_DISPLAY, Role};
 use crate::display::{Layouts, WaylandOutputs, wayland_output_id};
 use crate::input::authority::Sender;
 use crate::input::{ConnId, CursorMessage, Dispatcher, InputHost};
@@ -359,6 +359,11 @@ impl Display for ServerDisplay {
         keep: &HashSet<String>,
         primary_scale: f64,
     ) -> LayoutOutcome {
+        if layouts.len() == 1
+            && let Some(primary) = layouts.get(PRIMARY_DISPLAY)
+        {
+            self.screens.resize_kwin_host(primary.w, primary.h).await;
+        }
         match WaylandOutputs::running() {
             Some(outputs) => {
                 layout::before_primary(&outputs, Some(&self.screens), layouts, keep, primary_scale)
@@ -382,6 +387,11 @@ impl Display for ServerDisplay {
     }
 
     async fn wayland_size_screen(&self, w: i32, h: i32, scale: f64, grow_only: bool) {
+        // The pre-capture sizing step also sets the external host's real mode. The final
+        // shrink-to-capture step only updates the internal view over that host.
+        if grow_only {
+            self.screens.resize_kwin_host(w, h).await;
+        }
         if let Some(outputs) = WaylandOutputs::running() {
             outputs.size_screen(w, h, scale, grow_only).await;
         }
