@@ -21,7 +21,7 @@ const page = { devicePixelRatio: 2 } satisfies StandIn<Window>;
 Object.assign(globalThis, { window: page });
 
 const { streamDensity, publishedScale, autoScalingDpi, resolutionScalingDpi,
-        DPI_STOPS, capStreamSize, STREAM_SIDE_CAP } = await import(
+        DPI_STOPS, capStreamSize, alignedStreamSize, STREAM_SIDE_CAP } = await import(
     '../../web/selkies-web-core/lib/stream-density.ts');
 
 let failed = 0;
@@ -228,6 +228,17 @@ function check(label: string, ok: boolean, detail: unknown = ''): void {
     const css = capStreamSize(2560, 1316, STREAM_SIDE_CAP / 2);
     check('the CSS size scales to the cap over the density, both sides together',
         css[0] === 2040 && css[1] === 1048, css);
+}
+
+
+{
+    const align = (size: number): number => Math.floor(size / 16) * 16;
+    const retina = alignedStreamSize(2552 * 2, 1192 * 2, align);
+    check('a wide Retina viewport requests the aligned proportional mode',
+        retina[0] === 4080 && retina[1] === 1904, retina);
+    const within = alignedStreamSize(1601, 963, align);
+    check('a viewport within the cap keeps the encoder alignment',
+        within[0] === 1600 && within[1] === 960, within);
 }
 
 console.log(`\n[stream-density] ${failed ? 'FAILED' : 'OK'}`);

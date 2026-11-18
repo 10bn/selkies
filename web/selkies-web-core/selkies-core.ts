@@ -19,14 +19,12 @@
  * Persisted settings live in localStorage under the `getStorageAppName()`
  * namespace (origin plus pathname, never the query: a per-session `?token=`
  * must not mint a namespace per connect and exhaust the origin's quota). This
- * module also owns the one-time migration from the two legacy key schemes: a
- * sanitizer that kept `?`, `=`, and `:` literal, and a full-href derivation
- * whose token-scoped keys are pruned on every load to recover stores the leak
- * already filled.
+ * entry point and the transports import the storage migration before reading
+ * saved settings.
  * @module
  */
 
-import { getStorageAppName } from "./lib/util.ts";
+import { getPrefixedKey, safeSetItem } from "./lib/storage-migration.ts";
 import { titleFromManifest } from "./lib/page-title.ts";
 import webrtc from "./selkies-wr-core.ts";
 import websockets from "./selkies-ws-core.ts";
@@ -47,79 +45,6 @@ declare global {
 
 const STREAM_MODE_WEBRTC = "webrtc";
 const STREAM_MODE_WEBSOCKETS = "websockets";
-
-/** Origin plus pathname, the string the legacy key prefix was derived from. */
-const urlForKey: string = window.location.origin + window.location.pathname;
-const storageAppName: string = getStorageAppName();
-const getPrefixedKey = (key: string): string => {return `${storageAppName}_${key}`}
-/** Writes a key, degrading a full or unavailable store to a warning. */
-const safeSetItem = (key: string, value: string): void => {
-    try {
-        localStorage.setItem(key, value);
-    } catch (e) {
-        console.warn(`Selkies: could not persist '${key}' to localStorage:`, e);
-    }
-};
-
-/**
- * Migrates settings from the legacy key prefix and prunes token-scoped keys.
- *
- * Query-less legacy keys are copied to the current prefix once, and only when
- * no key under the current prefix exists yet, so settings saved since are
- * never clobbered; a flag key makes the copy run at most once. Token-scoped
- * keys (legacy prefix plus a literal `?`) are removed on every load, which is
- * cheap and frees quota before any write (`removeItem` never hits the quota).
- */
-(function migrateStorageKeys(): void {
-    try {
-        if (typeof localStorage === 'undefined') return;
-        // The legacy sanitizer kept a-z and 0x2E-0x5F literal.
-        let oldAppName = '';
-        for (let i = 0; i < urlForKey.length; i++) {
-            const c = urlForKey.charCodeAt(i);
-            oldAppName += ((c >= 0x2E && c <= 0x5F) || (c >= 0x61 && c <= 0x7A)) ? urlForKey[i] : '_';
-        }
-        const tokenPrefix = oldAppName + '?';
-        const staleKeys: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-            const k = localStorage.key(i);
-            if (k && k.startsWith(tokenPrefix)) staleKeys.push(k);
-        }
-        staleKeys.forEach((k) => localStorage.removeItem(k));
-        if (staleKeys.length) {
-            console.log(`Selkies: removed ${staleKeys.length} stale token-scoped localStorage keys.`);
-        }
-        if (oldAppName === storageAppName) return;
-        const migratedFlagKey = `${storageAppName}_storage_key_migrated`;
-        if (localStorage.getItem(migratedFlagKey) !== null) return;
-
-        const oldPrefix = `${oldAppName}_`;
-        const newPrefix = `${storageAppName}_`;
-
-        // Snapshot first: the loop below mutates localStorage.
-        const allKeys: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-            const k = localStorage.key(i);
-            if (k !== null) allKeys.push(k);
-        }
-        const hasNew = allKeys.some((k) => k.startsWith(newPrefix));
-        const oldKeys = allKeys.filter((k) => k.startsWith(oldPrefix));
-        if (!hasNew && oldKeys.length > 0) {
-            for (const oldKey of oldKeys) {
-                const suffix = oldKey.slice(oldPrefix.length);
-                const newKey = newPrefix + suffix;
-                if (localStorage.getItem(newKey) === null) {
-                    const val = localStorage.getItem(oldKey);
-                    if (val !== null) safeSetItem(newKey, val);
-                }
-            }
-            console.log(`Migrated ${oldKeys.length} setting(s) from old storage prefix "${oldPrefix}" to "${newPrefix}".`);
-        }
-        safeSetItem(migratedFlagKey, '1');
-    } catch (e) {
-        console.warn('Storage key migration skipped due to error:', e);
-    }
-})();
 
 let mode: StreamingCore | null | void = null;
 

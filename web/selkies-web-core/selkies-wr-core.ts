@@ -86,7 +86,7 @@
 import { WebRTCClient } from "./lib/webrtc.ts";
 import { WebRTCSignaling } from "./lib/signaling.ts";
 import { Input, slotPlayerIndex } from "./lib/input.ts";
-import { streamDensity as streamDensityOf, autoScalingDpi, resolutionScalingDpi, publishedScale, capStreamSize, STREAM_SIDE_CAP } from "./lib/stream-density.ts";
+import { streamDensity as streamDensityOf, autoScalingDpi, resolutionScalingDpi, publishedScale, alignedStreamSize } from "./lib/stream-density.ts";
 import { createClipboardSync, createClipboardGestures, createDeferredClipboardWriter, createIncomingClipboard, createLocalClipboardSender, createTaggedClipboardFetch, clipboardPreviewMessage, reencodeBlobAsPng, localClipboardBlocker, digestedPayload } from "./lib/clipboard-sync.ts";
 import { createFileUploader } from "./lib/file-upload.ts";
 import { ClipboardWorkerBridge, sendClipboardChunked } from './lib/clipboard-worker-bridge.ts';
@@ -97,7 +97,8 @@ import { getSessionToken, installSessionCookie, sessionAuthHeaders } from './lib
 import { urlFragmentKeyword } from './lib/page-url.ts';
 import { titleFromSettings } from './lib/page-title.ts';
 import { storageKeyForServerKey, resolveSpec, resolveBoolean, HIDPI_SPEC, RAW_POINTER_MOTION_SPEC, MAC_CMD_AS_CTRL_SPEC } from './lib/conditional-settings.ts';
-import { getRoutePrefix, getStorageAppName, canDecodeFullColor, canDecodeTenBit, tenBitFormat, canReceiveEncoder, isCaptureRefusal, isMacDesktop, displayLabel, entryPageTag, serverAnswers, rememberCcStart, forgetCcStart } from './lib/util.ts';
+import { getRoutePrefix, canDecodeFullColor, canDecodeTenBit, tenBitFormat, canReceiveEncoder, isCaptureRefusal, isMacDesktop, displayLabel, entryPageTag, serverAnswers, rememberCcStart, forgetCcStart } from './lib/util.ts';
+import { storageAppName } from './lib/storage-migration.ts';
 import { keyboardAssist, showVirtualKeyboard } from './lib/virtual-keyboard.ts';
 import { codecOfEncoder, codecCarriesFullColor, codecCarriesTenBit } from './lib/wire-codecs.ts';
 import { WEBCAM_ENCODER_PREFERENCES } from './lib/webcam-capture.ts';
@@ -367,6 +368,7 @@ export default function webrtc(): {initialize: () => void, cleanup: () => void} 
 	 * from the request (snapping, a rejected resize).
 	 */
 	var lastRequestedStreamRes: number[] | null = null;
+	let windowViewportCapped = false;
 	/** Screen Wake Lock sentinel, null while not held. */
 	let wakeLockSentinel: WakeLockSentinel | null = null;
 	let preferredOutputDeviceId: string | null = null;
@@ -618,7 +620,6 @@ export default function webrtc(): {initialize: () => void, cleanup: () => void} 
 	/** Whether the server's `mk_access` action granted this viewer the full input context. */
 	let collabInputGranted = false;
 
-	const storageAppName = getStorageAppName();
 	/** The last server_settings payload, posted again when the display's settings change under the dashboards. */
 	let lastServerSettings: Record<string, ServerSettingEntry> | null = null;
 	/** Writes a key, degrading a full or unavailable store to a warning. */
@@ -1574,9 +1575,12 @@ export default function webrtc(): {initialize: () => void, cleanup: () => void} 
 	function resetToWindowResolution(targetWidth: number, targetHeight: number): void {
 		if (!videoElement) return;
 
-		const dpr = streamDensity();
-		const logicalWidth = alignResolution(targetWidth * dpr);
-		const logicalHeight = alignResolution(targetHeight * dpr);
+		const [logicalWidth, logicalHeight, dpr] = streamResolution(targetWidth, targetHeight);
+		windowViewportCapped = logicalWidth !== alignResolution(targetWidth * dpr)
+			|| logicalHeight !== alignResolution(targetHeight * dpr);
+		const { videoWidth, videoHeight } = videoElement;
+		window.streamResolutionDiverged = windowViewportCapped
+			|| (videoWidth > 0 && videoHeight > 0 && (videoWidth !== logicalWidth || videoHeight !== logicalHeight));
 		console.log(`resetToWinRes logicalWidth: ${logicalWidth} logicalHeight: ${logicalHeight}`)
 		if (videoElement.width !== logicalWidth || videoElement.height !== logicalHeight) {
 			videoElement.width = logicalWidth;
@@ -1672,8 +1676,8 @@ export default function webrtc(): {initialize: () => void, cleanup: () => void} 
 	 */
 	function streamResolution(width: number, height: number): number[] {
 		const dpr = window.manualResolution ? 1 : streamDensity();
-		const [w, h] = capStreamSize(alignResolution(width * dpr), alignResolution(height * dpr));
-		return [alignResolution(w), alignResolution(h), dpr];
+		const [w, h] = alignedStreamSize(width * dpr, height * dpr, alignResolution);
+		return [w, h, dpr];
 	}
 
 	/**
@@ -1760,9 +1764,8 @@ export default function webrtc(): {initialize: () => void, cleanup: () => void} 
 	 * A manual preset applied while a debounce is pending is not overwritten
 	 * when it fires. `enable_resize` false pins the primary's resolution
 	 * server-side, so the resize the server ignores is neither requested nor
-	 * restyled onto; a secondary's stays allowed. The CSS size is scaled down,
-	 * both sides together, so the physical request stays within the 4080 cap
-	 * and the element box matches what the server realizes.
+	 * restyled onto; a secondary's stays allowed. Only the physical request
+	 * is capped; the displayed frame still fills the CSS viewport.
 	 */
 	function handleResizeUI(): void {
 		if (window.manualResolution) {
@@ -1775,7 +1778,6 @@ export default function webrtc(): {initialize: () => void, cleanup: () => void} 
 		const dpr = streamDensity();
 		appliedStreamDensity = dpr;
 		if (input && input.setStreamDensity) input.setStreamDensity(dpr);
-		windowResolution = capStreamSize(windowResolution[0], windowResolution[1], STREAM_SIDE_CAP / dpr);
 		sendResolutionToServer(windowResolution[0], windowResolution[1]);
 		resetToWindowResolution(windowResolution[0], windowResolution[1]);
 	}
@@ -2056,11 +2058,7 @@ export default function webrtc(): {initialize: () => void, cleanup: () => void} 
 						} else if (!isSharedMode && input &&
 							(window.enable_resize !== false || storageDisplayId === 'display2')) {
 							// A pinned primary keeps its resolution; secondaries stay allowed.
-							const currentWindowRes = input.getWindowResolution();
-							const autoWidth = alignResolution(currentWindowRes[0]);
-							const autoHeight = alignResolution(currentWindowRes[1]);
-							sendResolutionToServer(autoWidth, autoHeight);
-							resetToWindowResolution(autoWidth, autoHeight);
+							handleResizeUI();
 						}
 						pushScalingDpi();
 					}
@@ -3060,8 +3058,8 @@ export default function webrtc(): {initialize: () => void, cleanup: () => void} 
 				// request routes input through the video's fitted box instead of window math.
 				const vw = videoElement!.videoWidth, vh = videoElement!.videoHeight;
 				if (vw > 0 && vh > 0 && lastRequestedStreamRes) {
-					window.streamResolutionDiverged =
-						(vw !== lastRequestedStreamRes[0] || vh !== lastRequestedStreamRes[1]);
+					window.streamResolutionDiverged = windowViewportCapped
+						|| vw !== lastRequestedStreamRes[0] || vh !== lastRequestedStreamRes[1];
 				}
 				if (!isSharedMode) updateVideoImageRendering();
 				// The realized buffer just settled. A resize that did not change the
@@ -3906,6 +3904,9 @@ perms = parsed;
 		/** Tears the session down: listeners, timers, the worker, and every session-scoped value back to its default. */
 		cleanup(): void {
 			window.manualResolution = false;
+			windowViewportCapped = false;
+			lastRequestedStreamRes = null;
+			window.streamResolutionDiverged = false;
 			window.fps = 0;
 			stopWebcamCapture();
 

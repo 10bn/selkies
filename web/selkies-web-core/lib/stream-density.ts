@@ -108,9 +108,26 @@ export const STREAM_SIDE_CAP = 4080;
  * @returns The width and the height.
  */
 export function capStreamSize(width: number, height: number, cap: number = STREAM_SIDE_CAP): [number, number] {
-  const scale = Math.min(1, cap / width, cap / height);
-  if (!(scale < 1)) return [width, height];
-  return [Math.floor(width * scale), Math.floor(height * scale)];
+  const longest = Math.max(width, height);
+  if (!(longest > cap)) return [width, height];
+  const scale = cap / longest;
+  return [
+    Math.floor(width === longest ? cap : width * scale),
+    Math.floor(height === longest ? cap : height * scale),
+  ];
+}
+
+/**
+ * Limits a physical stream size after initial encoder alignment. Both sides
+ * share the cap's scale, then align again to keep the mode encoder-compatible.
+ * @param width Requested physical width.
+ * @param height Requested physical height.
+ * @param align Encoder alignment for one side.
+ * @returns Aligned physical width and height.
+ */
+export function alignedStreamSize(width: number, height: number, align: (size: number) => number): [number, number] {
+  const [cappedWidth, cappedHeight] = capStreamSize(align(width), align(height));
+  return [align(cappedWidth), align(cappedHeight)];
 }
 
 /** The stream box `publishedScale` measures. */

@@ -120,7 +120,7 @@ import {
   digestedPayload
 } from './lib/clipboard-sync.ts';
 import { ClipboardWorkerBridge, sendClipboardChunked } from './lib/clipboard-worker-bridge.ts';
-import { streamDensity as streamDensityOf, autoScalingDpi, resolutionScalingDpi, publishedScale, capStreamSize, STREAM_SIDE_CAP } from './lib/stream-density.ts';
+import { streamDensity as streamDensityOf, autoScalingDpi, resolutionScalingDpi, publishedScale, alignedStreamSize, STREAM_SIDE_CAP } from './lib/stream-density.ts';
 import {
   createFileUploader
 } from './lib/file-upload.ts';
@@ -132,7 +132,8 @@ import { urlFragmentKeyword } from './lib/page-url.ts';
 import { titleFromSettings } from './lib/page-title.ts';
 import { storageKeyForServerKey, resolveSpec, resolveBoolean, isEncoderBackends, tenBitStream, HIDPI_SPEC, RAW_POINTER_MOTION_SPEC, MAC_CMD_AS_CTRL_SPEC } from './lib/conditional-settings.ts';
 import { CRASH_SAFE_SETTINGS, holdKeys, holdDisplaySettings, releaseHeldSettings, restoreHeldPicks } from './lib/held-settings.ts';
-import { getRoutePrefix, getStorageAppName, canDecodeEncoder, canDecodeFullColor, fullColorDecoded, canDecodeTenBit, tenBitDecoded, DECODER_PROBE_TIMEOUT_MS, h264Framing, h264FramingReady, isCaptureRefusal, isMacDesktop, isSkiaWebKit, displayLabel, entryPageTag, pageTabId, serverAnswers, rememberCcStart, recalledCcStart, forgetCcStart } from './lib/util.ts';
+import { getRoutePrefix, canDecodeEncoder, canDecodeFullColor, fullColorDecoded, canDecodeTenBit, tenBitDecoded, DECODER_PROBE_TIMEOUT_MS, h264Framing, h264FramingReady, isCaptureRefusal, isMacDesktop, isSkiaWebKit, displayLabel, entryPageTag, pageTabId, serverAnswers, rememberCcStart, recalledCcStart, forgetCcStart } from './lib/util.ts';
+import { storageAppName } from './lib/storage-migration.ts';
 import { keyboardAssist, showVirtualKeyboard } from './lib/virtual-keyboard.ts';
 import {
   wireCodecName, wireFrameIsKey, codecOfEncoder, codecCarriesFullColor, codecCarriesTenBit, codecStringFor,
@@ -1080,7 +1081,6 @@ window.onload = (): void => {
   'use strict';
 };
 
-const storageAppName = getStorageAppName();
 /**
  * localStorage write that degrades a full or unavailable store to a warning
  * instead of throwing QuotaExceededError into the caller.
@@ -3886,8 +3886,7 @@ function getCurrentSettingsPayload(): Record<string, unknown> {
         const rect = videoContainer ? videoContainer.getBoundingClientRect() : { width: window.innerWidth, height: window.innerHeight };
         settingsToSend['manual_resolution'] = false;
         
-        const [initW, initH] = capStreamSize(alignResolution(rect.width * dpr), alignResolution(rect.height * dpr))
-          .map(alignResolution);
+        const [initW, initH] = alignedStreamSize(rect.width * dpr, rect.height * dpr, alignResolution);
 
         settingsToSend['initialClientWidth'] = initW;
         settingsToSend['initialClientHeight'] = initH;
@@ -3906,12 +3905,22 @@ function getCurrentSettingsPayload(): Record<string, unknown> {
 }
 
 /**
+ * The physical mode sent to the server and whether layout fits it to the viewport.
+ */
+interface RequestedStreamSize {
+  width: number;
+  height: number;
+  capped: boolean;
+}
+
+/**
  * Sends `r,WxH,displayId` with the aligned, DPR-scaled stream resolution,
  * scaled down on both sides together where one exceeds the 4080 cap; blocked in shared mode, where the viewer follows the controller.
  * @param width CSS pixels, or the exact size in manual mode.
  * @param height
+ * @returns Physical geometry when the page can send a resolution request.
  */
-function sendResolutionToServer(width: number, height: number): void {
+function sendResolutionToServer(width: number, height: number): RequestedStreamSize | undefined {
   if (isSharedMode) {
     console.log("Shared mode: Resolution sending to server is blocked.");
     return;
@@ -3942,8 +3951,9 @@ function sendResolutionToServer(width: number, height: number): void {
   // realized size counts as a divergence for it.
   const capped = realWidth > STREAM_SIDE_CAP || realHeight > STREAM_SIDE_CAP;
   if (capped) {
-    [realWidth, realHeight] = capStreamSize(realWidth, realHeight).map(alignResolution);
+    [realWidth, realHeight] = alignedStreamSize(realWidth, realHeight, alignResolution);
   }
+  if (!(realWidth > 0 && realHeight > 0)) return;
   lastRequestedStreamRes = (window.manual_resolution || capped) ? null : [realWidth, realHeight, width, height];
 
   const resString = `${realWidth}x${realHeight}`;
@@ -3953,6 +3963,28 @@ function sendResolutionToServer(width: number, height: number): void {
     websocket.send(`r,${resString},${displayId}`);
   } else {
     console.warn("Cannot send resolution via WebSocket: Connection not open.");
+  }
+  return { width: realWidth, height: realHeight, capped };
+}
+
+/**
+ * Requests the viewport's stream and fits capped pixels to the original box.
+ * The CSS dimensions describe the full viewport, even when the encoder needs
+ * fewer physical pixels. Input uses the fitted box in that case.
+ * @param width Viewport width in CSS pixels.
+ * @param height Viewport height in CSS pixels.
+ */
+function resizeAutomaticStream(width: number, height: number): void {
+  const request = sendResolutionToServer(width, height);
+  if (!request) return;
+  clearAllVncStripeDecoders();
+  window.streamResolutionDiverged = request.capped;
+  if (request.capped) {
+    // Keep the alignment on the same pixel step after converting to CSS.
+    applyManualCanvasStyle((request.width + 0.5) / appliedStreamDensity,
+                           (request.height + 0.5) / appliedStreamDensity, true);
+  } else {
+    resetCanvasStyle(width, height);
   }
 }
 
@@ -5054,9 +5086,8 @@ const initializeInput = (): void => {
    * the canvas. Skipped in shared and manual mode, and on the primary when
    * `enable_resize=false` pins its resolution server-side (a secondary's
    * resize is its layout bring-up and stays allowed, matching the server).
-   * The page's decoder is closed first, to be rebuilt by the key frame at
-   * the new geometry, and the divergence flag is reset for stream_resolution
-   * to re-flag.
+   * The page's decoder is rebuilt by the key frame at the new geometry.
+   * A capped stream fits the viewport at its lower density.
    */
   const handleResizeUI = (): void => {
     if (!initializationComplete) {
@@ -5079,26 +5110,8 @@ const initializeInput = (): void => {
     }
 
     console.log("handleResizeUI: Auto-resize triggered (e.g., by window resize event).");
-    const windowResolution = inputInstance.getWindowResolution();
-    let evenWidth = alignResolution(windowResolution[0]);
-    let evenHeight = alignResolution(windowResolution[1]);
-
-    const dpr = streamDensity();
-    appliedStreamDensity = dpr;
-    if (inputInstance && inputInstance.setStreamDensity) inputInstance.setStreamDensity(dpr);
-    if (evenWidth * dpr > STREAM_SIDE_CAP || evenHeight * dpr > STREAM_SIDE_CAP) {
-        [evenWidth, evenHeight] = capStreamSize(evenWidth, evenHeight, STREAM_SIDE_CAP / dpr).map(alignResolution);
-    }
-
-    if (evenWidth <= 0 || evenHeight <= 0) {
-      console.warn(`handleResizeUI: Calculated invalid dimensions (${evenWidth}x${evenHeight}). Skipping resize send.`);
-      return;
-    }
-
-    clearAllVncStripeDecoders();
-    window.streamResolutionDiverged = false;
-    sendResolutionToServer(evenWidth, evenHeight);
-    resetCanvasStyle(evenWidth, evenHeight);
+    const [width, height] = inputInstance.getWindowResolution();
+    resizeAutomaticStream(width, height);
   };
 
   handleResizeUI_globalRef = handleResizeUI;
@@ -5459,10 +5472,7 @@ function receiveMessage(event: Pick<MessageEvent<DashboardMessage>, 'origin' | '
           } else if (!isSharedMode) {
             if (window.enable_resize !== false || displayId === 'display2') {
               const currentWindowRes = window.webrtcInput ? window.webrtcInput.getWindowResolution() : [window.innerWidth, window.innerHeight];
-              const autoWidth = alignResolution(currentWindowRes[0]);
-              const autoHeight = alignResolution(currentWindowRes[1]);
-              sendResolutionToServer(autoWidth, autoHeight);
-              resetCanvasStyle(autoWidth, autoHeight);
+              resizeAutomaticStream(currentWindowRes[0], currentWindowRes[1]);
             }
           } else {
              if (manual_width && manual_height) {
@@ -7987,8 +7997,9 @@ class WorkerWebSocket {
           height: window.innerHeight
         };
         settingsToSend['manual_resolution'] = false;
-        settingsToSend['initialClientWidth'] = alignResolution(rect.width * dpr);
-        settingsToSend['initialClientHeight'] = alignResolution(rect.height * dpr);
+        const [initialWidth, initialHeight] = alignedStreamSize(rect.width * dpr, rect.height * dpr, alignResolution);
+        settingsToSend['initialClientWidth'] = initialWidth;
+        settingsToSend['initialClientHeight'] = initialHeight;
       }
 
       if (settingsToSend['scaling_dpi'] === undefined) {
@@ -8915,9 +8926,10 @@ class WorkerWebSocket {
                const bufferHeight = alignResolution(appliedHeight);
                const requested = !window.manual_resolution && lastRequestedStreamRes &&
                    bufferWidth === lastRequestedStreamRes[0] && bufferHeight === lastRequestedStreamRes[1];
-               if (canvas && bufferWidth > 0 && bufferHeight > 0 &&
-                   (canvas.width !== bufferWidth || canvas.height !== bufferHeight)) {
-                 clearAllVncStripeDecoders();
+               const fitRealizedSize = !window.manual_resolution && !requested && !window.streamResolutionDiverged;
+               const bufferChanged = canvas && (canvas.width !== bufferWidth || canvas.height !== bufferHeight);
+               if (canvas && bufferWidth > 0 && bufferHeight > 0 && (bufferChanged || fitRealizedSize)) {
+                 if (bufferChanged) clearAllVncStripeDecoders();
                  if (requested) {
                    // This page's own request, which the buffer has not caught up with.
                    window.streamResolutionDiverged = false;
