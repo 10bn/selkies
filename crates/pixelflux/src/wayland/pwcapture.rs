@@ -418,14 +418,13 @@ fn negotiated_params(n: &Negotiated, dmabuf: bool) -> Vec<Vec<u8>> {
     ]
 }
 
-/// Whether a new configuration needs another format offer. A size change needs one when
-/// the producer has yet to announce that size. Cursor placement is independent of the format.
-fn renegotiates(cur: &StreamConfig, new: &StreamConfig, negotiated: Option<Negotiated>) -> bool {
+/// Whether a configuration changes the format offer. Compare the requested sizes because
+/// the producer may still be answering a previous offer. Cursor placement is independent.
+fn renegotiates(cur: &StreamConfig, new: &StreamConfig) -> bool {
     cur.zero_copy != new.zero_copy
         || cur.dma_formats != new.dma_formats
         || cur.fps_milli != new.fps_milli
-        || (cur.expect != new.expect
-            && negotiated.is_none_or(|format| (format.width, format.height) != new.expect))
+        || cur.expect != new.expect
 }
 
 /// A `Meta` param asking for one metadata type of the given size (a plain or ranged Int).
@@ -1030,16 +1029,16 @@ impl PwStream {
         Ok(this)
     }
 
-    /// Reoffer the format when its buffer types, rate cap, or unfulfilled size preference
-    /// changes. A producer that sizes its stream from the consumer's preference needs the
-    /// updated offer. Fixed-size monitor streams can still choose their own size from the range.
+    /// Reoffer the format when its buffer types, rate cap, or size preference changes.
+    /// A producer that sizes its stream from the consumer's preference needs the updated offer.
+    /// Fixed-size monitor streams can still choose their own size from the range.
     pub fn reconfigure(&self, cfg: StreamConfig) {
         let pods = {
             let mut cur = self.shared.cfg.lock().unwrap();
             if *cur == cfg {
                 return;
             }
-            let renegotiate = renegotiates(&cur, &cfg, *self.shared.negotiated.lock().unwrap());
+            let renegotiate = renegotiates(&cur, &cfg);
             *cur = cfg;
             if !renegotiate {
                 return;
@@ -1221,14 +1220,7 @@ mod tests {
             },
             ..cur.clone()
         };
-        let negotiated = Some(Negotiated {
-            width: cur.expect.0,
-            height: cur.expect.1,
-            fourcc: FOURCC_XR24,
-            modifier: Some(0),
-        });
-        assert!(!renegotiates(&cur, &moved, None));
-        assert!(!renegotiates(&cur, &moved, negotiated));
+        assert!(!renegotiates(&cur, &moved));
     }
 
     /// A stamp a little before its frame's arrival, later than the last, is the capture
@@ -1419,44 +1411,35 @@ mod tests {
         assert_eq!(shm_code(FOURCC_XB24), FOURCC_XB24);
     }
 
-    /// A changed size is offered until the producer has fixed the requested dimensions.
+    /// A second size request replaces the previous offer even if the producer has not
+    /// answered it and the new request equals the still-negotiated size.
     #[test]
-    fn a_size_change_reoffers_only_if_the_negotiated_format_differs() {
+    fn returning_to_the_previous_size_reoffers_it() {
         let cur = cfg(false);
         let resized = StreamConfig {
             expect: (1280, 720),
             ..cur.clone()
         };
-        let format = |(width, height)| {
-            Some(Negotiated {
-                width,
-                height,
-                fourcc: FOURCC_XR24,
-                modifier: None,
-            })
-        };
-        assert!(renegotiates(&cur, &resized, None));
-        assert!(renegotiates(&cur, &resized, format(cur.expect)));
-        assert!(!renegotiates(&cur, &resized, format(resized.expect)));
-        assert!(!renegotiates(&resized, &resized, format(cur.expect)));
+        assert!(renegotiates(&cur, &resized));
+        assert!(renegotiates(&resized, &cur));
+        assert!(!renegotiates(&resized, &resized));
     }
 
-    /// A new rate cap or buffer type reoffers even when the size is already negotiated.
+    /// A new rate cap or buffer configuration reoffers at the same size.
     #[test]
     fn rate_and_buffer_changes_reoffer_the_format() {
         let cur = cfg(false);
-        let negotiated = Some(Negotiated {
-            width: cur.expect.0,
-            height: cur.expect.1,
-            fourcc: FOURCC_XR24,
-            modifier: None,
-        });
         let capped = StreamConfig {
             fps_milli: 30_000,
             ..cur.clone()
         };
-        assert!(renegotiates(&cur, &capped, negotiated));
-        assert!(renegotiates(&cur, &cfg(true), negotiated));
+        let formats = StreamConfig {
+            dma_formats: vec![(FOURCC_XR24, vec![0])],
+            ..cur.clone()
+        };
+        assert!(renegotiates(&cur, &capped));
+        assert!(renegotiates(&cur, &formats));
+        assert!(renegotiates(&cur, &cfg(true)));
     }
 
     /// The cursor meta's size range takes the fixed sizes compositors offer it at, Mutter's
