@@ -1221,7 +1221,14 @@ mod tests {
             },
             ..cur.clone()
         };
-        assert!(!renegotiates(&cur, &moved, true));
+        let negotiated = Some(Negotiated {
+            width: cur.expect.0,
+            height: cur.expect.1,
+            fourcc: FOURCC_XR24,
+            modifier: Some(0),
+        });
+        assert!(!renegotiates(&cur, &moved, None));
+        assert!(!renegotiates(&cur, &moved, negotiated));
     }
 
     /// A stamp a little before its frame's arrival, later than the last, is the capture
@@ -1434,29 +1441,19 @@ mod tests {
         assert!(!renegotiates(&resized, &resized, format(cur.expect)));
     }
 
-    /// Cursor placement leaves the offer alone, while buffer and rate changes reoffer it.
+    /// A new rate cap or buffer type reoffers even when the size is already negotiated.
     #[test]
-    fn placement_alone_keeps_the_format_offer() {
+    fn rate_and_buffer_changes_reoffer_the_format() {
         let cur = cfg(false);
-        let placed = StreamConfig {
-            place: CursorPlace {
-                origin: (640, 0),
-                ..cur.place
-            },
-            ..cur.clone()
-        };
         let negotiated = Some(Negotiated {
             width: cur.expect.0,
             height: cur.expect.1,
             fourcc: FOURCC_XR24,
             modifier: None,
         });
-        assert!(!renegotiates(&cur, &placed, None));
-        assert!(!renegotiates(&cur, &placed, negotiated));
-
         let capped = StreamConfig {
             fps_milli: 30_000,
-            ..placed
+            ..cur.clone()
         };
         assert!(renegotiates(&cur, &capped, negotiated));
         assert!(renegotiates(&cur, &cfg(true), negotiated));
