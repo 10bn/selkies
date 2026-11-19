@@ -3811,6 +3811,13 @@ export class Input {
         const sinkW = video ? video.videoWidth : sink.width;
         const sinkH = video ? video.videoHeight : sink.height;
         if (!(sinkW > 0 && sinkH > 0)) return null;
+        // A blank canvas starts at 300x150 before the WS core configures its
+        // buffer and CSS size. The same size is valid once either is set.
+        if (canvas && sinkW === 300 && sinkH === 150
+                && !canvas.style.width && !canvas.style.height
+                && !canvas.hasAttribute('width') && !canvas.hasAttribute('height')) {
+            return null;
+        }
         let rect = sink.getBoundingClientRect();
         if (!(rect.width > 0 && rect.height > 0)) {
             if (!this._sinkMirrors) {

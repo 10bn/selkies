@@ -311,6 +311,25 @@ for (const tagName of ['CANVAS', 'VIDEO']) {
           last?.startsWith('m,960,447,') === true, last);
 }
 
+// --- the default canvas buffer is not yet a presented stream --------------
+{
+    const style = { objectFit: 'fill', width: '', height: '' };
+    const sink = { ...makeSink(300, 150, 1920, 907), style, hasAttribute: () => false };
+    const input = makeInput({ sink, manual: false });
+    const event = standIn<MouseEvent>({ type: 'mousemove', target: input.element, clientX: 960, clientY: 454 });
+    input._mouseButtonMovement(event);
+    input._flushCoalescedMouseMove();
+    check('an unconfigured canvas uses window geometry', input.sent[0]?.startsWith('m,960,454,') === true,
+          input.sent[0]);
+
+    style.width = '1920px';
+    style.height = '907px';
+    input._mouseButtonMovement(event);
+    input._flushCoalescedMouseMove();
+    check('a configured 300x150 stream uses its real canvas geometry', input.sent[1]?.startsWith('m,150,75,') === true,
+          input.sent[1]);
+}
+
 // --- a button event maps its own position ---------------------------------
 {
     // The lock leaves movement deltas behind, so a release that arrives after
