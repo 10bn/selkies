@@ -1435,7 +1435,7 @@ mod tests {
         };
         let formats = StreamConfig {
             dma_formats: vec![(FOURCC_XR24, vec![0])],
-            ..cur.clone()
+            ..cur
         };
         assert!(renegotiates(&cur, &capped));
         assert!(renegotiates(&cur, &formats));
