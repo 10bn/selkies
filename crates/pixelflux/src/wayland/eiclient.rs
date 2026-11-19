@@ -23,13 +23,14 @@
 //! managed keymap; the compositor's own keymap (delivered over EIS) is
 //! read-only here, so a key's base keysym is resolved against it and the
 //! modifiers its level needs are synthesized, with a raw-keycode fallback for a
-//! keysym that keymap does not carry.
+//! keysym that keymap does not carry. Committed text takes the same queue and uses the
+//! compositor's optional `ei_text` device, which accepts UTF-8 without a keymap.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reis::PendingRequestResult;
@@ -37,6 +38,7 @@ use reis::ei;
 use reis::event::{DeviceCapability, EiEvent, EiEventConverter};
 use reis::handshake::ei_handshake_blocking;
 
+use crate::Error;
 use crate::wayland::keymap::{KeymapPolicy, compile_keymap};
 use crate::wayland::wlclient::wake_pipe;
 
@@ -46,6 +48,9 @@ const EVDEV_OFFSET: u32 = 8;
 /// The worker's one-shot readiness report to `spawn`: ready once a device bound, else the reason
 /// the session yielded no injector.
 type Ready = Arc<(Mutex<Option<Result<(), String>>>, std::sync::Condvar)>;
+
+/// Submission result. False means the text request was never sent and can fall back.
+pub(crate) type TextReply = mpsc::Sender<Result<bool, Error>>;
 
 /// One injection request, produced on selkies' input threads and drained on the EIS thread.
 enum Cmd {
@@ -77,6 +82,10 @@ enum Cmd {
         xkb_keycode: u32,
         keysym: Option<u32>,
         pressed: bool,
+    },
+    Text {
+        text: String,
+        reply: TextReply,
     },
 }
 
@@ -126,10 +135,15 @@ impl EiInjector {
     }
 
     fn push(&self, cmd: Cmd) {
+        let mut queue = self.queue.lock().unwrap();
         if !self.alive() {
+            if let Cmd::Text { reply, .. } = cmd {
+                let _ = reply.send(Ok(false));
+            }
             return;
         }
-        self.queue.lock().unwrap().push(cmd);
+        queue.push(cmd);
+        drop(queue);
         let _ = nix_write(self.wake.as_raw_fd());
     }
 
@@ -169,6 +183,16 @@ impl EiInjector {
         let v = steps * 120;
         let (x, y) = if axis == 0 { (0, v) } else { (v, 0) };
         self.push(Cmd::ScrollDiscrete { x, y });
+    }
+
+    /// Submit UTF-8 in order with key events and report whether the EIS device took it.
+    pub(crate) fn type_text(&self, text: String, reply: TextReply) {
+        // ei_text.utf8 allows 255 bytes including the terminator, one request per frame.
+        if text.is_empty() || text.len() > 254 || text.as_bytes().contains(&0) {
+            let _ = reply.send(Ok(false));
+            return;
+        }
+        self.push(Cmd::Text { text, reply });
     }
 
     pub(crate) fn key(&self, xkb_keycode: u32, keysym: Option<u32>, pressed: bool) {
@@ -227,6 +251,7 @@ struct Device {
     button: Option<ei::Button>,
     scroll: Option<ei::Scroll>,
     keyboard: Option<ei::Keyboard>,
+    text: Option<ei::Text>,
     keymap: Option<KeymapPolicy>,
 }
 
@@ -235,6 +260,7 @@ struct Worker {
     converter: EiEventConverter,
     devices: Vec<Device>,
     last_serial: u32,
+    text_announced: bool,
     /// Held modifier evdev keycodes and their press count, so a key that synthesized a modifier
     /// releases exactly what it added.
     mod_refs: HashMap<u32, u32>,
@@ -268,6 +294,7 @@ impl Worker {
             converter: EiEventConverter::new(&context, resp),
             context,
             devices: Vec::new(),
+            text_announced: false,
             mod_refs: HashMap::new(),
             pressed: HashMap::new(),
         };
@@ -305,6 +332,7 @@ impl Worker {
             }
         }
         alive.store(false, Ordering::Relaxed);
+        queue.lock().unwrap().clear();
         if !reported {
             Self::signal(&ready, Err("EIS session closed before it was ready".into()));
         }
@@ -387,7 +415,8 @@ impl Worker {
                         | DeviceCapability::Keyboard
                         | DeviceCapability::Button
                         | DeviceCapability::Scroll
-                        | DeviceCapability::Touch,
+                        | DeviceCapability::Touch
+                        | DeviceCapability::Text,
                 );
                 let _ = self.context.flush();
             }
@@ -412,6 +441,7 @@ impl Worker {
                     button: device.interface(),
                     scroll: device.interface(),
                     keyboard: device.interface(),
+                    text: device.interface(),
                     keymap,
                     device: device.device().clone(),
                     resumed: false,
@@ -433,6 +463,10 @@ impl Worker {
                 if let Some(d) = self.find_mut(&evt.device) {
                     d.resumed = true;
                     d.emulating = false;
+                }
+                if !self.text_announced && self.ready_index(|d| d.text.is_some()).is_some() {
+                    println!("[HostCapture] EIS text input available on the host compositor.");
+                    self.text_announced = true;
                 }
             }
             EiEvent::KeyboardModifiers(evt) => {
@@ -531,7 +565,25 @@ impl Worker {
                 keysym,
                 pressed,
             } => self.emit_key(xkb_keycode, keysym, pressed),
+            Cmd::Text { text, reply } => {
+                let _ = reply.send(self.emit_text(&text));
+            }
         }
+    }
+
+    /// Send a committed string in a frame of its own. A successful flush reports submission
+    /// to the compositor, which has no application-level receipt in the EIS protocol.
+    fn emit_text(&mut self, text: &str) -> Result<bool, Error> {
+        let Some(i) = self.ready_index(|d| d.text.as_ref().is_some_and(ei::Text::is_alive)) else {
+            return Ok(false);
+        };
+        self.start(i);
+        self.devices[i].text.as_ref().unwrap().utf8(text);
+        self.frame(i);
+        self.context
+            .flush()
+            .map_err(|e| Error::Compositor(format!("Failed to send EIS text: {e}")))?;
+        Ok(true)
     }
 
     fn emit_key(&mut self, xkb_keycode: u32, keysym: Option<u32>, pressed: bool) {
@@ -709,10 +761,17 @@ mod tests {
 
     /// The injector, run against a minimal in-process EIS server, emits the protocol a
     /// compositor expects: it binds the seat, starts emulating before the first event, and
-    /// sends absolute motion, buttons, keys, and discrete scroll, each committed by a frame.
+    /// sends absolute motion, buttons, keys, text, and discrete scroll, each committed by a frame.
     /// A fractional move is resolved against the region announced by the emulated device.
     #[test]
     fn injector_emits_the_expected_eis_protocol() {
+        for offer_text in [false, true] {
+            check_eis_protocol(offer_text);
+        }
+    }
+
+    /// Exercise the real socket handshake with and without the optional text capability.
+    fn check_eis_protocol(offer_text: bool) {
         use reis::eis;
         use reis::handshake::EisHandshaker;
         use reis::request::{EisRequest, EisRequestConverter};
@@ -741,14 +800,15 @@ mod tests {
             };
             let mut converter = EisRequestConverter::new(&ctx, resp, 1);
             let handle = converter.handle().clone();
-            let seat = handle.add_seat(
-                Some("test"),
-                DeviceCapability::Pointer
-                    | DeviceCapability::PointerAbsolute
-                    | DeviceCapability::Button
-                    | DeviceCapability::Scroll
-                    | DeviceCapability::Keyboard,
-            );
+            let mut capabilities = DeviceCapability::Pointer
+                | DeviceCapability::PointerAbsolute
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll
+                | DeviceCapability::Keyboard;
+            if offer_text {
+                capabilities.insert(DeviceCapability::Text);
+            }
+            let seat = handle.add_seat(Some("test"), capabilities);
             let _ = handle.flush();
             let mut device = None;
             loop {
@@ -791,6 +851,7 @@ mod tests {
                             k.key,
                             matches!(k.state, eis::keyboard::KeyState::Press)
                         )),
+                        EisRequest::TextUtf8(t) => log.push(format!("text {}", t.text)),
                         EisRequest::ScrollDiscrete(s) => {
                             log.push(format!("scroll {} {}", s.discrete_dx, s.discrete_dy));
                         }
@@ -808,6 +869,15 @@ mod tests {
         injector.pointer_button(0x110, false);
         injector.key(38, None, true);
         injector.key(38, None, false);
+        let (reply, response) = mpsc::channel();
+        injector.type_text("äÄöÖüÜß".into(), reply);
+        assert_eq!(
+            response
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            offer_text
+        );
         injector.pointer_axis_discrete(0, 1);
         std::thread::sleep(Duration::from_millis(400));
         drop(injector);
@@ -842,6 +912,29 @@ mod tests {
             got.contains(&"key 30 false".to_string()),
             "key release: {got:?}"
         );
+        if offer_text {
+            let key = got
+                .iter()
+                .position(|entry| entry == "key 30 false")
+                .unwrap();
+            let text = got
+                .iter()
+                .position(|entry| entry == "text äÄöÖüÜß")
+                .unwrap();
+            let scroll = got
+                .iter()
+                .position(|entry| entry == "scroll 0 120")
+                .unwrap();
+            assert!(
+                key < text && text < scroll,
+                "text respects the input order: {got:?}"
+            );
+        } else {
+            assert!(
+                !got.iter().any(|entry| entry.starts_with("text ")),
+                "{got:?}"
+            );
+        }
         assert!(
             got.contains(&"scroll 0 120".to_string()),
             "discrete scroll: {got:?}"

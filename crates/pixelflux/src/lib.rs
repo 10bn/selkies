@@ -832,6 +832,12 @@ pub enum ThreadCommand {
     KeyboardKeys {
         events: Vec<(u32, u32)>,
     },
+    /// Commit UTF-8 through an external host's EIS session, in order with keyboard events.
+    KeyboardText {
+        display: String,
+        text: String,
+        reply: crate::wayland::eiclient::TextReply,
+    },
     /// Set the seat's BASE keymap from a full XKB_KEYMAP_FORMAT_TEXT_V1 string. The
     /// compositor's keymap policy rebuilds on top: overlay binds are re-spliced onto the new
     /// base (same keycodes) and the combined keymap is applied in one swap.
@@ -7495,6 +7501,17 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     );
                 }
             }
+            ThreadCommand::KeyboardText {
+                display,
+                text,
+                reply,
+            } => {
+                if let Some(host) = &state.host {
+                    host.type_text(&display, text, reply);
+                } else {
+                    let _ = reply.send(Ok(false));
+                }
+            }
             ThreadCommand::SetKeymapString(text) => {
                 // rebuild_base rejects a string that will not compile without touching
                 // the policy, so the seat keymap survives a bad one either way.
@@ -8759,6 +8776,25 @@ impl Compositor {
         self.send(ThreadCommand::KeyboardKeys { events })
             .map_err(|e| Error::Compositor(format!("Failed to inject keys: {e}")))?;
         Ok(())
+    }
+
+    /// Submit text through the host's EIS device without swapping the keyboard map.
+    /// False means the device was unavailable. An error after queuing leaves delivery unknown.
+    fn type_text_eis(&self, display: String, text: String) -> Result<bool, Error> {
+        let (reply, response) = std::sync::mpsc::channel();
+        if self
+            .send(ThreadCommand::KeyboardText {
+                display,
+                text,
+                reply,
+            })
+            .is_err()
+        {
+            return Ok(false);
+        }
+        response
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|e| Error::Compositor(format!("EIS text submission not confirmed: {e}")))?
     }
 
     /// Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text). The caller
@@ -10261,6 +10297,13 @@ impl ScreenCapture {
 
     pub fn get_xkb_keymap_string(&self) -> Result<String, Error> {
         running_compositor().map_or(Ok(String::new()), |be| be.get_xkb_keymap_string())
+    }
+
+    /// Submit committed text to the app compositor through the optional host EIS device.
+    /// False leaves the text for another injector, and an error may indicate an uncertain
+    /// submission. Call from a blocking task, since the worker confirms dispatch.
+    pub fn type_text_eis(&self, display: String, text: String) -> Result<bool, Error> {
+        running_compositor().map_or(Ok(false), |be| be.type_text_eis(display, text))
     }
 
     /// Compositor-side clipboard offer: serve one payload per `(mime, data)` entry.

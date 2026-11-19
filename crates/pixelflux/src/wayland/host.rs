@@ -1027,6 +1027,7 @@ impl HostKeyboardState {
 /// The calloop-side session: input proxies plus one capture handle per output.
 pub struct HostSession {
     conn: Connection,
+    socket_path: String,
     vk: Option<ZwpVirtualKeyboardV1>,
     keyboard: Mutex<HostKeyboardState>,
     vptr: Option<ZwlrVirtualPointerV1>,
@@ -1280,6 +1281,7 @@ impl HostSession {
         }
         Ok(Self {
             conn,
+            socket_path: path,
             vk,
             keyboard: Mutex::new(keyboard),
             vptr,
@@ -1730,6 +1732,17 @@ impl HostSession {
             Some(sym) => p.keysym(sym as i32, pressed),
             None => p.keycode(xkb_keycode as i32 - 8, pressed),
         });
+    }
+
+    /// Submit text only to the host compositor whose socket contains the focused app.
+    pub(crate) fn type_text(&self, display: &str, text: String, reply: super::eiclient::TextReply) {
+        if socket_path(display).as_deref() == Some(self.socket_path.as_str())
+            && let Some(live) = self.portal_ei()
+        {
+            live.ei.as_ref().unwrap().type_text(text, reply);
+        } else {
+            let _ = reply.send(Ok(false));
+        }
     }
 
     /// Run `f` with the portal session while one is live.

@@ -11,7 +11,7 @@
 //!
 //! Keyboard injection follows the module-level ladders. On Wayland all key work is serialized
 //! through one queue and a single worker task so key ordering holds across the seat,
-//! virtual-keyboard, and clipboard rungs; on X11 injection goes straight to the X thread
+//! EIS text, virtual-keyboard, and clipboard rungs; on X11 injection goes straight to the X thread
 //! (XTEST first, xdotool fallback) with stale-key sweeping and server-side auto-repeat
 //! emulation, since XTEST presses do not trigger the server's native repeat. Clients heartbeat
 //! held keys every 100 ms (`kh`) but hidden tabs throttle to a second or more, so the stale
@@ -694,14 +694,32 @@ impl Dispatcher {
         }
     }
 
-    /// Type the buffered text (non-layout keysyms and IME strings) through
-    /// `zwp_virtual_keyboard`, or paste it via the clipboard on a compositor without that
-    /// protocol (KWin); never through the keymap overlay.
+    /// Type non-layout keysyms and IME strings through the app compositor's EIS text
+    /// device when it has one. Otherwise use its virtual keyboard or clipboard. A batch
+    /// whose submission is uncertain cannot safely be resent through another injector.
     async fn flush_text_buffer(self: &Arc<Self>, buffer: &mut String) {
         if buffer.is_empty() {
             return;
         }
         let text = std::mem::take(buffer);
+        if self.has_separate_app_compositor()
+            && let Some(seat) = self.seat.clone()
+        {
+            let display = self.app_wayland_display();
+            let batch = text.clone();
+            match tokio::task::spawn_blocking(move || seat.type_text_eis(display, batch)).await {
+                Ok(Ok(true)) => return,
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    warn!(target: "input", "EIS text delivery could not be confirmed: {e}");
+                    return;
+                }
+                Err(e) => {
+                    warn!(target: "input", "EIS text task ended before confirming delivery: {e}");
+                    return;
+                }
+            }
+        }
         match self.wl_type_text(&text).await {
             Ok(()) => return,
             Err(e) => {

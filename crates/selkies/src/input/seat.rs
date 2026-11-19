@@ -38,6 +38,11 @@ pub trait WaylandSeat: Send + Sync {
     ) -> Result<bool, Error>;
     /// `(pressed keycodes, modifier mask)` with mask bit 16 Caps Lock.
     fn get_keyboard_state(&self) -> Result<(Vec<u32>, u32), Error>;
+    /// Submit UTF-8 through the optional host EIS text device. An error leaves the outcome
+    /// uncertain, while false means another injector can safely handle the text.
+    fn type_text_eis(&self, _display: String, _text: String) -> Result<bool, Error> {
+        Ok(false)
+    }
     /// Tap keysyms through `display`'s virtual keyboard; `Error::Unavailable` when the
     /// compositor lacks the protocol.
     fn type_keysyms_wayland(&self, display: String, keysyms: Vec<u32>) -> Result<(), Error>;
@@ -91,6 +96,10 @@ impl WaylandSeat for ScreenCapture {
 
     fn get_keyboard_state(&self) -> Result<(Vec<u32>, u32), Error> {
         ScreenCapture::get_keyboard_state(self)
+    }
+
+    fn type_text_eis(&self, display: String, text: String) -> Result<bool, Error> {
+        ScreenCapture::type_text_eis(self, display, text)
     }
 
     fn type_keysyms_wayland(&self, display: String, keysyms: Vec<u32>) -> Result<(), Error> {

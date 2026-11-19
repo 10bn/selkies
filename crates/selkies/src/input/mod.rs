@@ -14,7 +14,8 @@
 //! cooldowns that re-probe the top rung rather than latching into a fallback:
 //!
 //! - Wayland keyboard: the compositor seat keymap ([`wayland_keymap::WaylandKeymapOwner`]),
-//!   then the in-process `zwp_virtual_keyboard` client pixelflux runs, then a data-control
+//!   then committed text through the external compositor's EIS text device when available,
+//!   otherwise through the in-process `zwp_virtual_keyboard` client or a data-control
 //!   clipboard paste. The Wayland path is subprocess-free by design; never reintroduce wtype,
 //!   wl-copy, or similar forks where the in-process pixelflux harness exists.
 //! - X11 keyboard: in-process XTEST ([`x11_keyboard::XTestKeyboard`], with a dynamic
@@ -23,7 +24,7 @@
 //!
 //! Under a nested app compositor the seat rung only carries keysyms the base layout resolves,
 //! so the keyboard worker routes character-bearing keysyms the base lacks onto the
-//! virtual-keyboard text batch by classification, not by failure. That batch and the selection
+//! text batch by classification, not by failure. That batch and the selection
 //! are aimed at the auto-detected app compositor: the live `wayland-<N>` socket beside the
 //! capture compositor's, never a differently named relay; aiming at the capture compositor
 //! instead silently kills every non-ASCII key.
