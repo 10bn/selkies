@@ -1058,12 +1058,13 @@ impl PwStream {
         *self.shared.params.lock().unwrap() = pods;
     }
 
-    /// Return a published frame's buffer to the compositor.
+    /// Return a published frame's buffer to the compositor. Check its generation
+    /// under the loop lock, which also protects the callbacks that replace slots.
     pub fn release(&self, generation: u64, slot: usize) {
-        if generation != self.shared.generation.load(Ordering::Acquire) {
-            return;
-        }
         self.core.locked(|| {
+            if generation != self.shared.generation.load(Ordering::Acquire) {
+                return;
+            }
             let mut buffers = self.shared.buffers.lock().unwrap();
             if let Some(s) = buffers.get_mut(slot).filter(|s| s.held && !s.pw.is_null()) {
                 s.held = false;
