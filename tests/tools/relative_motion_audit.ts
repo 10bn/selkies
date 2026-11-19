@@ -33,6 +33,9 @@ interface Sink {
     tagName: string;
     width: number;
     height: number;
+    videoWidth?: number;
+    videoHeight?: number;
+    style?: { objectFit: string };
     getBoundingClientRect: () => { left: number; top: number; width: number; height: number };
 }
 
@@ -63,19 +66,22 @@ function engineCss(devicePx: number[], dpr: number): number[] {
 const steps = (n: number, delta: number): number[] => new Array<number>(n).fill(delta);
 
 /**
- * An Input with only what the relative-motion path touches. `sink` gives the
- * stream box a manual-resolution or shared session maps through.
+ * An Input with the browser objects its motion paths read. A sink gives
+ * the presented frame's dimensions in stream and CSS pixels.
  */
-function makeInput({ dpr = 1, sink = null }: { dpr?: number; sink?: Sink | null } = {}): AuditedInput {
+function makeInput({ dpr = 1, sink = null, manual = sink !== null }:
+        { dpr?: number; sink?: Sink | null; manual?: boolean } = {}): AuditedInput {
+    const sinkId = sink?.tagName === 'VIDEO' ? 'stream' : 'videoCanvas';
     page = {
         pointerLockElement: null,
-        getElementById: (id) => (sink && id === 'videoCanvas' ? sink : null),
+        getElementById: (id) => id === sinkId ? sink : null,
     };
     Object.assign(globalThis, {
         window: {
             devicePixelRatio: dpr,
-            manual_resolution: !!sink,
-            manualResolution: !!sink,
+            manual_resolution: manual && sinkId === 'videoCanvas',
+            manualResolution: manual && sinkId === 'stream',
+            streamResolutionDiverged: false,
             requestAnimationFrame: (cb: FrameRequestCallback) => frames.push(cb),
         } satisfies StandIn<Window>,
         document: page satisfies StandIn<Document>,
@@ -194,13 +200,13 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
 {
     const sink = makeSink(1920, 1080, 960, 540);
     const input = makeInput({ dpr: 1, sink });
-    input._applySinkCoordinates(100, 50, standIn<HTMLCanvasElement>(sink), null);
+    input._applySinkCoordinates(100, 50);
     check('a click maps through the stream box', input.x === 200 && input.y === 100,
           `${input.x},${input.y}`);
     const [dx, dy] = input._relativeToServer(100, 50);
     check('a delta of the same size covers the same ground',
           dx === 200 && dy === 100, `${dx},${dy}`);
-    input._applySinkCoordinates(5000, -20, standIn<HTMLCanvasElement>(sink), null);
+    input._applySinkCoordinates(5000, -20);
     check('a click outside the box is clamped to the stream',
           input.x === 1920 && input.y === 0, `${input.x},${input.y}`);
 }
@@ -269,6 +275,40 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const last = input.sent[input.sent.length - 1];
     check('absolute motion reaches every server pixel at dpr 2',
           typeof last === 'string' && last.startsWith('m,201,'), `${last}`);
+}
+
+// --- an aligned automatic mode still maps through the picture -------------
+for (const tagName of ['CANVAS', 'VIDEO']) {
+    let reads = 0;
+    let boxHeight = 907;
+    const sink: Sink = { ...makeSink(1920, 896, 1920, boxHeight), tagName,
+        getBoundingClientRect: () => {
+            reads++;
+            return { left: 0, top: 0, width: 1920, height: boxHeight };
+        } };
+    if (tagName === 'VIDEO') {
+        sink.videoWidth = 1920;
+        sink.videoHeight = 896;
+        sink.style = { objectFit: 'fill' };
+    }
+    const input = makeInput({ sink, manual: false });
+    frames = [];
+    for (const [clientX, clientY, expectedY] of [[384, 91, 90], [960, 454, 448], [1555, 816, 806], [1402, 889, 878]]) {
+        input._mouseButtonMovement(standIn<MouseEvent>({ type: 'mousemove', target: input.element, clientX, clientY }));
+        input._flushCoalescedMouseMove();
+        const last = input.sent[input.sent.length - 1];
+        check(`${tagName} auto: ${clientX},${clientY} maps to the aligned frame`,
+              last?.startsWith(`m,${clientX},${expectedY},`) === true, last);
+    }
+    check(`${tagName} auto: pointer events share one geometry measurement per frame`, reads === 1, reads);
+
+    boxHeight = 911;
+    for (const cb of frames) cb(0);
+    input._mouseButtonMovement(standIn<MouseEvent>({ type: 'mouseup', target: input.element,
+                                 button: 0, clientX: 960, clientY: 454 }));
+    const last = input.sent[input.sent.length - 1];
+    check(`${tagName} auto: a button event uses the resized CSS box`,
+          last?.startsWith('m,960,447,') === true, last);
 }
 
 // --- a button event maps its own position ---------------------------------

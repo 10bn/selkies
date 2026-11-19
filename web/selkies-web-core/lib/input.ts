@@ -42,8 +42,8 @@
  * briefly to tell AltGr apart.
  *
  * Pointer: absolute positions map through the presenting sink (the canvas or
- * `<video>` box) where the stream has a fixed size, and through the element's
- * window math otherwise; motion goes out as it arrives, from
+ * `<video>` box), with the element's window math as a fallback before
+ * presentation is ready; motion goes out as it arrives, from
  * `pointerrawupdate` where the engine fires it, no closer together than
  * `MOTION_SEND_INTERVAL_MS` apart.
  * Under pointer lock the payload is a relative delta, scaled to server pixels
@@ -100,6 +100,16 @@ interface PointerMath {
     frameW: number;
     /** The element's layout height. */
     frameH: number;
+}
+
+/** The presented frame's CSS box and its stream-pixel dimensions. */
+interface StreamSinkBox {
+    boxLeft: number;
+    boxTop: number;
+    boxW: number;
+    boxH: number;
+    sinkW: number;
+    sinkH: number;
 }
 
 /** One display of the extended desktop, as `Input.setDisplayLayouts` keeps it. */
@@ -1842,6 +1852,7 @@ export class Input {
     _longPressSince!: number;
     _sinkMirrors!: Record<string, HTMLElement | null>;
     _lastSinkRect!: DOMRect;
+    _pointerSinkBoxFrame!: StreamSinkBox | null;
     _lastCursorDensity!: number | null;
     _cursorResizeObserver!: ResizeObserver;
     _cursorMutationObserver!: MutationObserver;
@@ -1926,6 +1937,7 @@ export class Input {
         this._relCarryX = 0;
         this._relCarryY = 0;
         this._pointerScaleFrame = null;
+        this._pointerSinkBoxFrame = null;
         this._pendingMove = null;
         this._moveFlushScheduled = false;
         /** When the last pointer motion message went out (`performance.now()`). */
@@ -3307,8 +3319,6 @@ export class Input {
         var mtype: 'm' | 'm2' = "m";
         let relX = 0;
         let relY = 0;
-        let canvas = elementByTag('videoCanvas', 'canvas');
-        let videoEle = elementByTag('stream', 'video');
         if (event.type === 'mousedown' || event.type === 'mouseup' || event.type === 'pointerdown' || event.type === 'pointerup' || event.type === 'pointercancel') {
             if (event.button === 1) { 
                 event.preventDefault(); 
@@ -3338,8 +3348,7 @@ export class Input {
         } else if (event.type === 'mousemove' || event.type === 'pointermove' || raw ||
                    event.type === 'mousedown' || event.type === 'mouseup' ||
                    event.type === 'pointerdown' || event.type === 'pointerup') {
-            if (this._applySinkCoordinates(event.clientX, event.clientY, canvas, videoEle,
-                                           event.screenX, event.screenY)) {
+            if (this._applySinkCoordinates(event.clientX, event.clientY, event.screenX, event.screenY)) {
                 // Mapped through the sink; this.x/this.y are set.
             } else {
                 if (!this.m) {
@@ -3782,41 +3791,26 @@ export class Input {
     }
 
     /**
-     * The box a fixed-size sink presents the stream in, in CSS pixels, or
-     * null when no sink applies (auto resolution) or the box cannot be
-     * measured, so callers run their device-scaled window math instead. The
-     * sink is the ws-core canvas (manual resolution or shared mode) or the
-     * wr-core `<video>` (manual resolution; each core has its own flag).
+     * Measures the picture in CSS pixels and the stream pixels it contains.
+     * Automatic resolution can stretch the picture independently on each
+     * axis: the requested mode is rounded to encoder alignment while the
+     * CSS box retains the viewport's size.
      *
-     * `window.streamResolutionDiverged` means the server realized a different
-     * resolution than the window-derived request (mode snapping, a rejected
-     * mode set), so the window-math contract (CSS times dpr equals server
-     * pixels) is broken and coordinates map through the stream box like
-     * manual mode: the canvas buffer on the WebSocket core, the `<video>`
-     * intrinsic size on the WebRTC core.
-     *
-     * ws-core hides `#videoCanvas` while frames are presented on the video or
-     * worker sink, which mirrors the canvas box, so a zero-size box means
-     * hidden, not resized: the visible mirror (`videoStream`,
-     * `videoWorkerCanvas`) is measured instead, else the last valid rect. The
-     * mirror lookups are cached since this runs per pointer event; a node
-     * that left the DOM (`deactivateVideoWorker`) is re-queried. A `<video>`
-     * reports its realized stream size in `videoWidth`/`videoHeight` (the
-     * attributes may be unset) and `object-fit: contain` letterboxes the
-     * frame inside the element box, so the mapping uses the fitted content
-     * box; a canvas reports its buffer.
-     * @param canvas
-     * @param videoEle
-     * @param measureCursor Measure even automatic resolution; wait for decoded video dimensions.
-     * @returns
+     * The WebSocket canvas defines the stream-pixel dimensions. A visible
+     * video or worker canvas mirrors its box while the canvas is hidden;
+     * keep its last measured box if it is between sinks. The WebRTC video
+     * reports the decoded dimensions, and contain mode fits the picture
+     * inside its element.
+     * @returns The picture geometry, or null before it can be measured.
      */
-    _sinkBox(canvas: HTMLCanvasElement | null, videoEle: HTMLVideoElement | null, measureCursor: boolean = false): { boxLeft: number; boxTop: number; boxW: number; boxH: number; sinkW: number; sinkH: number } | null {
-        const sink = ((measureCursor || window.manual_resolution || this.isSharedMode || window.streamResolutionDiverged) && canvas)
-            ? canvas
-            : ((measureCursor || window.manualResolution || window.streamResolutionDiverged) && videoEle) ? videoEle : null;
-        if (!sink || (measureCursor && isTag(sink, 'video') && !(sink.videoWidth > 0 && sink.videoHeight > 0))) {
-            return null;
-        }
+    _measureSinkBox(): StreamSinkBox | null {
+        const canvas = elementByTag('videoCanvas', 'canvas');
+        const video = canvas ? null : elementByTag('stream', 'video');
+        const sink = canvas ?? video;
+        if (!sink) return null;
+        const sinkW = video ? video.videoWidth : sink.width;
+        const sinkH = video ? video.videoHeight : sink.height;
+        if (!(sinkW > 0 && sinkH > 0)) return null;
         let rect = sink.getBoundingClientRect();
         if (!(rect.width > 0 && rect.height > 0)) {
             if (!this._sinkMirrors) {
@@ -3839,12 +3833,10 @@ export class Input {
         if (!(rect.width > 0 && rect.height > 0) && this._lastSinkRect) {
             rect = this._lastSinkRect;
         }
-        const sinkW = ('videoWidth' in sink ? sink.videoWidth : 0) || sink.width;
-        const sinkH = ('videoHeight' in sink ? sink.videoHeight : 0) || sink.height;
-        if (rect.width > 0 && rect.height > 0 && sinkW > 0 && sinkH > 0) {
+        if (rect.width > 0 && rect.height > 0) {
             this._lastSinkRect = rect;
             let boxLeft = rect.left, boxTop = rect.top, boxW = rect.width, boxH = rect.height;
-            if (sink.tagName === 'VIDEO' && (sink.style.objectFit || 'contain') !== 'fill') {
+            if (video && (video.style.objectFit || 'contain') !== 'fill') {
                 const fit = Math.min(rect.width / sinkW, rect.height / sinkH);
                 boxW = sinkW * fit;
                 boxH = sinkH * fit;
@@ -3854,6 +3846,20 @@ export class Input {
             return { boxLeft, boxTop, boxW, boxH, sinkW, sinkH };
         }
         return null;
+    }
+
+    /**
+     * Shares one measured box between pointer events in a frame so raw
+     * motion does not repeatedly measure layout.
+     */
+    _pointerSinkBox(): StreamSinkBox | null {
+        if (this._pointerSinkBoxFrame) return this._pointerSinkBoxFrame;
+        const box = this._measureSinkBox();
+        if (box && typeof window.requestAnimationFrame === 'function') {
+            this._pointerSinkBoxFrame = box;
+            window.requestAnimationFrame((): void => { this._pointerSinkBoxFrame = null; });
+        }
+        return box;
     }
 
     /**
@@ -3902,8 +3908,7 @@ export class Input {
      * @returns The box, or null where none applies.
      */
     _streamBox(): { left: number; top: number; width: number; height: number; scaleX: number; scaleY: number } | null {
-        const box = this._sinkBox(elementByTag('videoCanvas', 'canvas'),
-                                  elementByTag('stream', 'video'));
+        const box = this._pointerSinkBox();
         if (box) {
             return { left: box.boxLeft, top: box.boxTop, width: box.boxW, height: box.boxH,
                      scaleX: box.sinkW / box.boxW, scaleY: box.sinkH / box.boxH };
@@ -3989,8 +3994,8 @@ export class Input {
      * @param [screenY]
      * @returns False when no sink applies.
      */
-    _applySinkCoordinates(clientX: number, clientY: number, canvas: HTMLCanvasElement | null, videoEle: HTMLVideoElement | null, screenX?: number, screenY?: number): boolean {
-        const box = this._sinkBox(canvas, videoEle);
+    _applySinkCoordinates(clientX: number, clientY: number, screenX?: number, screenY?: number): boolean {
+        const box = this._pointerSinkBox();
         if (!box) {
             return false;
         }
@@ -4181,13 +4186,12 @@ export class Input {
      * Stream pixels per CSS pixel in the fitted content box. The requested
      * density is only a fallback before a sink can be measured: a manual
      * resolution, a capped stream, or a shared viewer can draw at a different
-     * scale. Cursor pixels and hotspots use that scale; input keeps its own
-     * mapping so this measurement never adds layout work to pointer motion.
+     * scale. Cursor pixels and hotspots use a uniform scale while input
+     * maps each axis independently.
      * @returns
      */
     _cursorDensity(): number {
-        const box = this._sinkBox(elementByTag('videoCanvas', 'canvas'),
-                                  elementByTag('stream', 'video'), true);
+        const box = this._measureSinkBox();
         if (box) return Math.max(box.sinkW / box.boxW, box.sinkH / box.boxH);
         if (this._streamDensity) {
             return this._streamDensity;
@@ -4197,6 +4201,8 @@ export class Input {
 
     /** Redraws a cached cursor only when its displayed scale changes. */
     _refreshCursorScale(): void {
+        this._pointerSinkBoxFrame = null;
+        this._pointerScaleFrame = null;
         const density = this._cursorDensity();
         if (density === this._lastCursorDensity) return;
         this._lastCursorDensity = density;
@@ -4317,10 +4323,7 @@ export class Input {
         this._latestMouseX = touchPoint.clientX;
         this._latestMouseY = touchPoint.clientY;
         const dpr_for_input_coords = this._inputDpr();
-        let canvas = elementByTag('videoCanvas', 'canvas');
-        let videoEle = elementByTag('stream', 'video');
-
-        if (this._applySinkCoordinates(touchPoint.clientX, touchPoint.clientY, canvas, videoEle,
+        if (this._applySinkCoordinates(touchPoint.clientX, touchPoint.clientY,
                                        touchPoint.screenX, touchPoint.screenY)) {
             // Mapped through the sink; this.x/this.y are set.
         } else {
@@ -5391,6 +5394,7 @@ export class Input {
 
     /** Derives the client-to-frame mapping of the element (letterbox offset and scale) into `this.m`, or null when it has no size. */
     _windowMath(): void {
+        this._pointerSinkBoxFrame = null;
         this._pointerScaleFrame = null;
         const elementRect = this.element.getBoundingClientRect();
         const windowW = elementRect.width; const windowH = elementRect.height;
